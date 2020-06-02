@@ -7,6 +7,7 @@ from kafka.errors import BrokerResponseError, KafkaTimeoutError, NodeNotReadyErr
 from karapace.config import create_ssl_context
 from karapace.karapace import KarapaceBase
 from karapace.rapu import HTTPRequest
+from karapace.schema_reader import SchemaType
 from karapace.serialization import InvalidMessageSchema, InvalidPayload, SchemaRegistrySerializer, SchemaRetrievalError
 from karapace.utils import convert_to_int
 from threading import Lock
@@ -373,7 +374,7 @@ class KafkaRest(KarapaceBase):
             KafkaRest.not_found(message=f"Partition {partition_id} not found", content_type=content_type, sub_code=404)
 
     @staticmethod
-    def is_valid_avro_request(data: dict, prefix: str) -> bool:
+    def is_valid_schema_request(data: dict, prefix: str) -> bool:
         schema_id = data.get(f"{prefix}_schema_id")
         schema = data.get(f"{prefix}_schema")
         if schema_id:
@@ -384,7 +385,7 @@ class KafkaRest(KarapaceBase):
                 return False
         return isinstance(schema, str)
 
-    async def get_schema_id(self, data: dict, topic: str, prefix: str) -> int:
+    async def get_schema_id(self, data: dict, topic: str, prefix: str, schema_type: SchemaType) -> int:
         self.log.debug("Retrieving schema id for %r", data)
         if f"{prefix}_schema_id" in data and data[f"{prefix}_schema_id"] is not None:
             self.log.debug(
@@ -395,14 +396,18 @@ class KafkaRest(KarapaceBase):
         self.log.debug("Registering / Retrieving ID for schema %s", schema_str)
         if schema_str not in self.schemas_cache:
             subject_name = self.serializer.get_subject_name(topic, data[f"{prefix}_schema"], prefix)
-            schema_id = await self.serializer.get_id_for_schema(data[f"{prefix}_schema"], subject_name)
+            schema_id = await self.serializer.get_id_for_schema(data[f"{prefix}_schema"], subject_name, schema_type)
             self.schemas_cache[schema_str] = schema_id
         return self.schemas_cache[schema_str]
 
-    async def validate_schema_info(self, data: dict, prefix: str, content_type: str, topic: str):
+    async def validate_schema_info(self, data: dict, prefix: str, content_type: str, topic: str, schema_type: str):
+        if schema_type == "jsonschema":
+            schema_type = SchemaType.JSONSCHEMA
+        if schema_type == "avro":
+            schema_type = SchemaType.AVRO
         # will do in place updates of id keys, since calling these twice would be expensive
         try:
-            data[f"{prefix}_schema_id"] = await self.get_schema_id(data, topic, prefix)
+            data[f"{prefix}_schema_id"] = await self.get_schema_id(data, topic, prefix, schema_type)
         except InvalidPayload:
             self.log.exception("Unable to retrieve schema id")
             self.r(body={"error_code": 400, "message": "Invalid schema string"}, content_type=content_type, status=400)
@@ -465,11 +470,11 @@ class KafkaRest(KarapaceBase):
             return json.dumps(obj).encode("utf8")
         if ser_format == "binary":
             return base64.b64decode(obj)
-        if ser_format == "avro":
-            return await self.avro_serialize(obj, schema_id)
+        if ser_format in {"avro", "jsonschema"}:
+            return await self.schema_serialize(obj, schema_id)
         raise FormatError(f"Unknown format: {ser_format}")
 
-    async def avro_serialize(self, obj: dict, schema_id: Optional[int]) -> bytes:
+    async def schema_serialize(self, obj: dict, schema_id: Optional[int]) -> bytes:
         schema = await self.serializer.get_schema_for_id(schema_id)
         bytes_ = await self.serializer.serialize(schema, obj)
         return bytes_
@@ -484,13 +489,13 @@ class KafkaRest(KarapaceBase):
         for r in data["records"]:
             convert_to_int(r, "partition", content_type)
             if set(r.keys()).difference(RECORD_KEYS):
-                self.unprocessable_entity(message=f"Invalid request format", content_type=content_type, sub_code=422)
+                self.unprocessable_entity(message="Invalid request format", content_type=content_type, sub_code=422)
         # disallow missing id and schema for any key/value list that has at least one populated element
-        if formats["embedded_format"] == "avro":
+        if formats["embedded_format"] in {"avro", "jsonschema"}:
             for prefix, code in zip(RECORD_KEYS, RECORD_CODES):
                 if self.all_empty(data, prefix):
                     continue
-                if not self.is_valid_avro_request(data, prefix):
+                if not self.is_valid_schema_request(data, prefix):
                     self.unprocessable_entity(
                         message=f"Request includes {prefix}s and uses a format that requires schemas "
                         f"but does not include the {prefix}_schema or {prefix}_schema_id fields",
@@ -498,7 +503,7 @@ class KafkaRest(KarapaceBase):
                         sub_code=code
                     )
                 try:
-                    await self.validate_schema_info(data, prefix, content_type, topic)
+                    await self.validate_schema_info(data, prefix, content_type, topic, formats["embedded_format"])
                 except InvalidMessageSchema as e:
                     self.unprocessable_entity(message=str(e), content_type=content_type, sub_code=42205)
 

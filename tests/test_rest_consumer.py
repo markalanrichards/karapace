@@ -1,16 +1,9 @@
-from tests.utils import consumer_valid_payload, new_topic, REST_HEADERS, schema_json, test_objects
+from tests.utils import consumer_valid_payload, new_consumer, new_topic, REST_HEADERS, schema_data
 
 import base64
 import copy
 import json
-
-
-async def new_consumer(c, group, fmt="avro"):
-    payload = copy.copy(consumer_valid_payload)
-    payload["format"] = fmt
-    resp = await c.post(f"/consumers/{group}", json=payload, headers=REST_HEADERS["avro"])
-    assert resp.ok
-    return resp.json()["instance_id"]
+import pytest
 
 
 async def test_create_and_delete(rest_async_client):
@@ -265,24 +258,25 @@ async def test_consume(rest_async_client, admin_client, producer):
                 f" does not match {values[fmt][i]} for format {fmt}"
 
 
-async def test_publish_consume_avro(rest_async_client, admin_client):
-    header = REST_HEADERS["avro"]
-    group_name = "e2e_group"
-    instance_id = await new_consumer(rest_async_client, group_name, fmt="avro")
+@pytest.mark.parametrize("schema_type", ["avro"])
+async def test_publish_consume_schema(rest_async_client, admin_client, schema_type):
+    tn = new_topic(admin_client)
+    header = REST_HEADERS[schema_type]
+    group_name = f"e2e_group_{schema_type}"
+    instance_id = await new_consumer(rest_async_client, group_name, fmt=schema_type)
     assign_path = f"/consumers/{group_name}/instances/{instance_id}/assignments"
     consume_path = f"/consumers/{group_name}/instances/{instance_id}/records?timeout=1000"
-    tn = new_topic(admin_client)
     assign_payload = {"partitions": [{"topic": tn, "partition": 0}]}
     res = await rest_async_client.post(assign_path, json=assign_payload, headers=header)
     assert res.ok
-
-    pl = {"value_schema": schema_json, "records": [{"value": o} for o in test_objects]}
+    publish_payload = schema_data[schema_type][1]
+    pl = {"value_schema": schema_data[schema_type][0], "records": [{"value": o} for o in publish_payload]}
     res = await rest_async_client.post(f"topics/{tn}", json=pl, headers=header)
     assert res.ok
     resp = await rest_async_client.get(consume_path, headers=header)
     assert resp.ok, f"Expected a successful response: {resp}"
     data = resp.json()
-    assert len(data) == len(test_objects), f"Expected to read test_objects from fetch request but got {data}"
+    assert len(data) == len(publish_payload), f"Expected to read test_objects from fetch request but got {data}"
     data_values = [x["value"] for x in data]
-    for expected, actual in zip(test_objects, data_values):
+    for expected, actual in zip(publish_payload, data_values):
         assert expected == actual, f"Expecting {actual} to be {expected}"
